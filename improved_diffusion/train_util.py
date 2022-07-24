@@ -6,8 +6,16 @@ import blobfile as bf
 import numpy as np
 import torch as th
 import torch.distributed as dist
+
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    FullyShardedDataParallel as FSDP,
+    CPUOffload,
+    MixedPrecision,
+)
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
 from . import dist_util, logger
 from .fp16_util import (
@@ -45,6 +53,7 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
+        use_fsdp=True,
     ):
         self.model = model
         self.diffusion = diffusion
@@ -69,15 +78,50 @@ class TrainLoop:
         self.step = 0
         self.resume_step = 0
         self.global_batch = self.batch_size * dist.get_world_size()
-
-        self.model_params = list(self.model.parameters())
-        self.master_params = self.model_params
         self.lg_loss_scale = INITIAL_LOG_LOSS_SCALE
         self.sync_cuda = th.cuda.is_available()
+        self.scaler = ShardedGradScaler()
 
         self._load_and_sync_parameters()
+
+        if th.cuda.is_available():
+            self.use_ddp = True
+            if not use_fsdp:
+                self.ddp_model = DDP(
+                    self.model,
+                    device_ids=[dist_util.dev()],
+                    output_device=dist_util.dev(),
+                    broadcast_buffers=False,
+                    bucket_cap_mb=128,
+                    find_unused_parameters=False,
+                )
+            else:
+                self.ddp_model = FSDP(
+                    self.model,
+                    cpu_offload=CPUOffload(offload_params=True),
+                    auto_wrap_policy=size_based_auto_wrap_policy,
+                    device_id=dist_util.dev(),
+                    mixed_precision=MixedPrecision(
+                        param_dtype=th.float16,
+                        reduce_dtype=th.float16,
+                        buffer_dtype=th.float16,
+                    )
+                )
+        else:
+            if dist.get_world_size() > 1:
+                logger.warn(
+                    "Distributed training requires CUDA. "
+                    "Gradients will not be synchronized properly!"
+                )
+            self.use_ddp = False
+            self.ddp_model = self.model
+
+        self.model_params = list(self.ddp_model.parameters())
+        self.master_params = self.model_params
+
         if self.use_fp16:
-            self._setup_fp16()
+            pass
+            # self._setup_fp16()
 
         self.opt = AdamW(self.master_params, lr=self.lr, weight_decay=self.weight_decay)
         if self.resume_step:
@@ -92,25 +136,6 @@ class TrainLoop:
                 copy.deepcopy(self.master_params) for _ in range(len(self.ema_rate))
             ]
 
-        if th.cuda.is_available():
-            self.use_ddp = True
-            self.ddp_model = DDP(
-                self.model,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
-        else:
-            if dist.get_world_size() > 1:
-                logger.warn(
-                    "Distributed training requires CUDA. "
-                    "Gradients will not be synchronized properly!"
-                )
-            self.use_ddp = False
-            self.ddp_model = self.model
-
     def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
 
@@ -124,7 +149,7 @@ class TrainLoop:
                     )
                 )
 
-        dist_util.sync_params(self.model.parameters())
+            dist_util.sync_params(self.model.parameters())
 
     def _load_ema_parameters(self, rate):
         ema_params = copy.deepcopy(self.master_params)
@@ -226,6 +251,7 @@ class TrainLoop:
                 loss.backward()
 
     def optimize_fp16(self):
+        '''
         if any(not th.isfinite(p.grad).all() for p in self.model_params):
             self.lg_loss_scale -= 1
             logger.log(f"Found NaN, decreased lg_loss_scale to {self.lg_loss_scale}")
@@ -240,6 +266,8 @@ class TrainLoop:
             update_ema(params, self.master_params, rate=rate)
         master_params_to_model_params(self.model_params, self.master_params)
         self.lg_loss_scale += self.fp16_scale_growth
+        '''
+        self._anneal_lr()
 
     def optimize_normal(self):
         self._log_grad_norm()
@@ -296,7 +324,7 @@ class TrainLoop:
     def _master_params_to_state_dict(self, master_params):
         if self.use_fp16:
             master_params = unflatten_master_params(
-                self.model.parameters(), master_params
+                list(self.model.parameters()), master_params
             )
         state_dict = self.model.state_dict()
         for i, (name, _value) in enumerate(self.model.named_parameters()):

@@ -1,0 +1,39 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "name": "Python: Module",
+            "type": "python",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "args": [
+                "--nproc_per_node",
+                "2",
+                "scripts/image_train.py",
+                "--image_size",
+                "64",
+                "--num_channels",
+                "128",
+                "--num_res_blocks",
+                "3",
+                "--learn_sigma",
+                "True",
+                "--diffusion_steps",
+                "4000",
+                "--noise_schedule",
+                "cosine",
+                "--lr",
+                "1e-4",
+                "--batch_size",
+                "64",
+                "--data_dir",
+                "/root/imagenet/autoencoders/data/ILSVRC2012_validation"
+            ],
+            "justMyCode": false
+        }
+    ]
+}

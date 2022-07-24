@@ -68,6 +68,7 @@ class UniformSampler(ScheduleSampler):
 
 
 class LossAwareSampler(ScheduleSampler):
+
     def update_with_local_losses(self, local_ts, local_losses):
         """
         Update the reweighting using losses from a model.

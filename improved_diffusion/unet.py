@@ -451,12 +451,6 @@ class UNetModel(nn.Module):
         self.input_blocks.apply(convert_module_to_f32)
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
-
-    @property
-    def inner_dtype(self):
-        """
-        Get the dtype used by the torso of the model.
-        """
         return next(self.input_blocks.parameters()).dtype
 
     def forward(self, x, timesteps, y=None):
@@ -479,7 +473,7 @@ class UNetModel(nn.Module):
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
 
-        h = x.type(self.inner_dtype)
+        h = x
         for module in self.input_blocks:
             h = module(h, emb)
             hs.append(h)
@@ -509,7 +503,7 @@ class UNetModel(nn.Module):
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
         result = dict(down=[], up=[])
-        h = x.type(self.inner_dtype)
+        h = x
         for module in self.input_blocks:
             h = module(h, emb)
             hs.append(h)
