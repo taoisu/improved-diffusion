@@ -9,7 +9,6 @@ import json
 import time
 import datetime
 import tempfile
-import warnings
 
 import os.path as osp
 import torch.distributed as dist
@@ -397,15 +396,6 @@ class Logger(object):
                 fmt.writeseq(map(str, args))
 
 
-def get_rank_without_mpi_import():
-    # check environment variables here instead of importing mpi4py
-    # to avoid calling MPI_Init() when this module is imported
-    for varname in ["PMI_RANK", "OMPI_COMM_WORLD_RANK"]:
-        if varname in os.environ:
-            return int(os.environ[varname])
-    return 0
-
-
 def torch_weighted_mean(local_name2valcount):
     rank = dist.get_rank()
     outputs = [None for _ in range(dist.get_world_size())]
@@ -418,36 +408,6 @@ def torch_weighted_mean(local_name2valcount):
                 n2c[k] = n2c.get(k, 0) + c
         ks = list(n2s.keys())
         return { k: n2s[k] / n2c[k] for k in ks }
-    else:
-        return {}
-
-
-def mpi_weighted_mean(comm, local_name2valcount):
-    """
-    Copied from: https://github.com/openai/baselines/blob/ea25b9e8b234e6ee1bca43083f8f3cf974143998/baselines/common/mpi_util.py#L110
-    Perform a weighted average over dicts that are each on a different node
-    Input: local_name2valcount: dict mapping key -> (value, count)
-    Returns: key -> mean
-    """
-    all_name2valcount = comm.gather(local_name2valcount)
-    if comm.rank == 0:
-        name2sum = defaultdict(float)
-        name2count = defaultdict(float)
-        for n2vc in all_name2valcount:
-            for (name, (val, count)) in n2vc.items():
-                try:
-                    val = float(val)
-                except ValueError:
-                    if comm.rank == 0:
-                        warnings.warn(
-                            "WARNING: tried to compute mean on non-float {}={}".format(
-                                name, val
-                            )
-                        )
-                else:
-                    name2sum[name] += val * count
-                    name2count[name] += count
-        return {name: name2sum[name] / name2count[name] for name in name2sum}
     else:
         return {}
 
@@ -467,7 +427,7 @@ def configure(dir=None, format_strs=None, comm=None, log_suffix=""):
     dir = os.path.expanduser(dir)
     os.makedirs(os.path.expanduser(dir), exist_ok=True)
 
-    rank = get_rank_without_mpi_import()
+    rank = dist.get_rank()
     if rank > 0:
         log_suffix = log_suffix + "-rank%03i" % rank
 

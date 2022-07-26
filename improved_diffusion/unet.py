@@ -17,7 +17,6 @@ from .nn import (
     zero_module,
     normalization,
     timestep_embedding,
-    checkpoint,
 )
 
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -35,7 +34,7 @@ def apply_fsdp_checkpointing(model: FSDP):
 
     non_reentrant_wrapper = partial(
         checkpoint_wrapper,
-        offload_to_cpu=True,
+        offload_to_cpu=False,
         checkpoint_impl=CheckpointImpl.NO_REENTRANT,
     )
 
@@ -149,7 +148,6 @@ class ResBlock(TimestepBlock):
         convolution instead of a smaller 1x1 convolution to change the
         channels in the skip connection.
     :param dims: determines if the signal is 1D, 2D, or 3D.
-    :param use_checkpoint: if True, use gradient checkpointing on this module.
     """
 
     def __init__(
@@ -161,7 +159,6 @@ class ResBlock(TimestepBlock):
         use_conv=False,
         use_scale_shift_norm=False,
         dims=2,
-        use_checkpoint=False,
     ):
         super().__init__()
         self.channels = channels
@@ -169,7 +166,6 @@ class ResBlock(TimestepBlock):
         self.dropout = dropout
         self.out_channels = out_channels or channels
         self.use_conv = use_conv
-        self.use_checkpoint = use_checkpoint
         self.use_scale_shift_norm = use_scale_shift_norm
 
         self.in_layers = nn.Sequential(
@@ -210,11 +206,6 @@ class ResBlock(TimestepBlock):
         :param emb: an [N x emb_channels] Tensor of timestep embeddings.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        return checkpoint(
-            self._forward, (x, emb), self.parameters(), self.use_checkpoint
-        )
-
-    def _forward(self, x, emb):
         h = self.in_layers(x)
         emb_out = self.emb_layers(emb).type(h.dtype)
         while len(emb_out.shape) < len(h.shape):
@@ -238,11 +229,10 @@ class AttentionBlock(nn.Module):
     https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
     """
 
-    def __init__(self, channels, num_heads=1, use_checkpoint=False):
+    def __init__(self, channels, num_heads=1):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
-        self.use_checkpoint = use_checkpoint
 
         self.norm = normalization(channels)
         self.qkv = conv_nd(1, channels, channels * 3, 1)
@@ -250,9 +240,6 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), self.use_checkpoint)
-
-    def _forward(self, x):
         b, c, *spatial = x.shape
         x = x.reshape(b, c, -1)
         qkv = self.qkv(self.norm(x))
@@ -327,7 +314,6 @@ class UNetModel(nn.Module):
     :param dims: determines if the signal is 1D, 2D, or 3D.
     :param num_classes: if specified (as an int), then this model will be
         class-conditional with `num_classes` classes.
-    :param use_checkpoint: use gradient checkpointing to reduce memory usage.
     :param num_heads: the number of attention heads in each attention layer.
     """
 
@@ -343,7 +329,6 @@ class UNetModel(nn.Module):
         conv_resample=True,
         dims=2,
         num_classes=None,
-        use_checkpoint=False,
         num_heads=1,
         num_heads_upsample=-1,
         use_scale_shift_norm=False,
@@ -362,7 +347,6 @@ class UNetModel(nn.Module):
         self.channel_mult = channel_mult
         self.conv_resample = conv_resample
         self.num_classes = num_classes
-        self.use_checkpoint = use_checkpoint
         self.num_heads = num_heads
         self.num_heads_upsample = num_heads_upsample
 
@@ -395,7 +379,6 @@ class UNetModel(nn.Module):
                         dropout,
                         out_channels=mult * model_channels,
                         dims=dims,
-                        use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
                     )
                 ]
@@ -403,7 +386,7 @@ class UNetModel(nn.Module):
                 if ds in attention_resolutions:
                     layers.append(
                         AttentionBlock(
-                            ch, use_checkpoint=use_checkpoint, num_heads=num_heads
+                            ch, num_heads=num_heads
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -421,16 +404,14 @@ class UNetModel(nn.Module):
                 time_embed_dim,
                 dropout,
                 dims=dims,
-                use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
-            AttentionBlock(ch, use_checkpoint=use_checkpoint, num_heads=num_heads),
+            AttentionBlock(ch, num_heads=num_heads),
             ResBlock(
                 ch,
                 time_embed_dim,
                 dropout,
                 dims=dims,
-                use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
         )
@@ -445,7 +426,6 @@ class UNetModel(nn.Module):
                         dropout,
                         out_channels=model_channels * mult,
                         dims=dims,
-                        use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
                     )
                 ]
@@ -454,7 +434,6 @@ class UNetModel(nn.Module):
                     layers.append(
                         AttentionBlock(
                             ch,
-                            use_checkpoint=use_checkpoint,
                             num_heads=num_heads_upsample,
                         )
                     )

@@ -118,7 +118,6 @@ def create_model(
         dropout=dropout,
         channel_mult=channel_mult,
         num_classes=(NUM_CLASSES if class_cond else None),
-        use_checkpoint=use_checkpoint,
         num_heads=num_heads,
         num_heads_upsample=num_heads_upsample,
         use_scale_shift_norm=use_scale_shift_norm,
