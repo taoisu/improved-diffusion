@@ -25,6 +25,8 @@ def setup_dist_torchrun():
         return
 
     dist.init_process_group(backend="nccl", init_method="env://")
+    dev_idx = int(os.environ['LOCAL_RANK'])
+    th.cuda.set_device(dev_idx)
 
 
 def dev():

@@ -5,13 +5,15 @@ https://github.com/openai/baselines/blob/ea25b9e8b234e6ee1bca43083f8f3cf97414399
 
 import os
 import sys
-import shutil
-import os.path as osp
 import json
 import time
 import datetime
 import tempfile
 import warnings
+
+import os.path as osp
+import torch.distributed as dist
+
 from collections import defaultdict
 from contextlib import contextmanager
 
@@ -353,18 +355,13 @@ class Logger(object):
         self.name2cnt[key] = cnt + 1
 
     def dumpkvs(self):
-        if self.comm is None:
-            d = self.name2val
-        else:
-            d = mpi_weighted_mean(
-                self.comm,
-                {
-                    name: (val, self.name2cnt.get(name, 1))
-                    for (name, val) in self.name2val.items()
-                },
-            )
-            if self.comm.rank != 0:
-                d["dummy"] = 1  # so we don't get a warning about empty dict
+        d = torch_weighted_mean(
+        {
+            name: (val, self.name2cnt.get(name, 1))
+            for (name, val) in self.name2val.items()
+        })
+        if dist.get_rank() != 0:
+            d["dummy"] = 1  # so we don't get a warning about empty dict
         out = d.copy()  # Return the dict for unit testing purposes
         for fmt in self.output_formats:
             if isinstance(fmt, KVWriter):
@@ -407,6 +404,22 @@ def get_rank_without_mpi_import():
         if varname in os.environ:
             return int(os.environ[varname])
     return 0
+
+
+def torch_weighted_mean(local_name2valcount):
+    rank = dist.get_rank()
+    outputs = [None for _ in range(dist.get_world_size())]
+    dist.gather_object(local_name2valcount, outputs if rank == 0 else None)
+    n2s, n2c = {}, {}
+    if dist.get_rank() == 0:
+        for n2vc in outputs:
+            for k, (v, c) in n2vc.items():
+                n2s[k] = n2s.get(k, 0) + v * c
+                n2c[k] = n2c.get(k, 0) + c
+        ks = list(n2s.keys())
+        return { k: n2s[k] / n2c[k] for k in ks }
+    else:
+        return {}
 
 
 def mpi_weighted_mean(comm, local_name2valcount):

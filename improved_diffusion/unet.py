@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from functools import partial
 
 import math
 
@@ -18,6 +19,36 @@ from .nn import (
     timestep_embedding,
     checkpoint,
 )
+
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    CheckpointImpl,
+    apply_activation_checkpointing_wrapper,
+    CheckpointWrapper,
+)
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    FullyShardedDataParallel as FSDP,
+)
+
+
+def apply_fsdp_checkpointing(model: FSDP):
+
+    non_reentrant_wrapper = partial(
+        checkpoint_wrapper,
+        offload_to_cpu=True,
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+    )
+
+    def check_fn(submodule: nn.Module):
+        is_resblock = isinstance(submodule, ResBlock)
+        is_attnblock = isinstance(submodule, AttentionBlock)
+        return is_resblock or is_attnblock
+
+    apply_activation_checkpointing_wrapper(
+        model,
+        checkpoint_wrapper_fn=non_reentrant_wrapper,
+        check_fn=check_fn,
+    )
 
 
 class TimestepBlock(nn.Module):
@@ -40,6 +71,8 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
 
     def forward(self, x, emb):
         for layer in self:
+            if isinstance(layer, CheckpointWrapper):
+                layer = layer._checkpoint_wrapped_module
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             else:

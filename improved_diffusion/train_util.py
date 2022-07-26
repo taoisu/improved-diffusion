@@ -7,7 +7,7 @@ import numpy as np
 import torch as th
 import torch.distributed as dist
 
-from torch.nn.parallel.distributed import DistributedDataParallel as DDP
+from torch.cuda.amp import autocast
 from torch.optim import AdamW
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     FullyShardedDataParallel as FSDP,
@@ -18,23 +18,12 @@ from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
 from . import dist_util, logger
-from .fp16_util import (
-    make_master_params,
-    master_params_to_model_params,
-    model_grads_to_master_grads,
-    unflatten_master_params,
-    zero_grad,
-)
-from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
-
-# For ImageNet experiments, this was a good default value.
-# We found that the lg_loss_scale quickly climbed to
-# 20-21 within the first ~1K steps of training.
-INITIAL_LOG_LOSS_SCALE = 20.0
+from .unet import apply_fsdp_checkpointing
 
 
 class TrainLoop:
+
     def __init__(
         self,
         *,
@@ -48,29 +37,25 @@ class TrainLoop:
         log_interval,
         save_interval,
         resume_checkpoint,
-        use_fp16=False,
-        fp16_scale_growth=1e-3,
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        use_fsdp=True,
     ):
-        self.model = model
+        self.main_model = model
         self.diffusion = diffusion
         self.data = data
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
         self.lr = lr
-        self.ema_rate = (
+        self.ema_rates = (
             [ema_rate]
             if isinstance(ema_rate, float)
             else [float(x) for x in ema_rate.split(",")]
         )
+        self.ema_models = [copy.deepcopy(model) for _ in self.ema_rates]
         self.log_interval = log_interval
         self.save_interval = save_interval
         self.resume_checkpoint = resume_checkpoint
-        self.use_fp16 = use_fp16
-        self.fp16_scale_growth = fp16_scale_growth
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
@@ -78,63 +63,48 @@ class TrainLoop:
         self.step = 0
         self.resume_step = 0
         self.global_batch = self.batch_size * dist.get_world_size()
-        self.lg_loss_scale = INITIAL_LOG_LOSS_SCALE
         self.sync_cuda = th.cuda.is_available()
         self.scaler = ShardedGradScaler()
 
         self._load_and_sync_parameters()
 
-        if th.cuda.is_available():
-            self.use_ddp = True
-            if not use_fsdp:
-                self.ddp_model = DDP(
-                    self.model,
-                    device_ids=[dist_util.dev()],
-                    output_device=dist_util.dev(),
-                    broadcast_buffers=False,
-                    bucket_cap_mb=128,
-                    find_unused_parameters=False,
-                )
-            else:
-                self.ddp_model = FSDP(
-                    self.model,
-                    cpu_offload=CPUOffload(offload_params=True),
-                    auto_wrap_policy=size_based_auto_wrap_policy,
-                    device_id=dist_util.dev(),
-                    mixed_precision=MixedPrecision(
-                        param_dtype=th.float16,
-                        reduce_dtype=th.float16,
-                        buffer_dtype=th.float16,
-                    )
-                )
-        else:
-            if dist.get_world_size() > 1:
-                logger.warn(
-                    "Distributed training requires CUDA. "
-                    "Gradients will not be synchronized properly!"
-                )
-            self.use_ddp = False
-            self.ddp_model = self.model
+        assert th.cuda.is_available()
+        self.use_ddp = True
+        FSDP_cls = functools.partial(
+            FSDP,
+            cpu_offload=CPUOffload(offload_params=False),
+            auto_wrap_policy=size_based_auto_wrap_policy,
+            device_id=dist_util.dev(),
+            mixed_precision=MixedPrecision(
+                param_dtype=th.float16,
+                reduce_dtype=th.float16,
+                buffer_dtype=th.float16,
+            )
+        )
+        self.ddp_main_model = FSDP_cls(self.main_model)
+        ddp_main_model = self.ddp_main_model
+        apply_fsdp_checkpointing(ddp_main_model)
+        ddp_main_model.train()
 
-        self.model_params = list(self.ddp_model.parameters())
-        self.master_params = self.model_params
+        self.model_params = list(ddp_main_model.parameters())
 
-        if self.use_fp16:
-            pass
-            # self._setup_fp16()
-
-        self.opt = AdamW(self.master_params, lr=self.lr, weight_decay=self.weight_decay)
+        self.opt = AdamW(self.model_params, lr=self.lr, weight_decay=self.weight_decay)
         if self.resume_step:
-            self._load_optimizer_state()
+            # self._load_optimizer_state()
             # Model was resumed, either due to a restart or a checkpoint
             # being specified at the command line.
-            self.ema_params = [
-                self._load_ema_parameters(rate) for rate in self.ema_rate
-            ]
+            # self.ema_params = [
+            #     self._load_ema_parameters(rate) for rate in self.ema_rate
+            # ]
+            pass
         else:
-            self.ema_params = [
-                copy.deepcopy(self.master_params) for _ in range(len(self.ema_rate))
-            ]
+            self.ddp_ema_models = [FSDP_cls(ema_model) for ema_model in self.ema_models]
+            for ddp_ema_model in self.ddp_ema_models:
+                for pair_master, pair_ema in zip(ddp_main_model.named_parameters(), ddp_ema_model.named_parameters()):
+                    name_master, p_master = pair_master
+                    name_ema, p_ema = pair_ema
+                    assert name_master == name_ema
+                    p_ema.detach().copy_(p_master.detach())
 
     def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
@@ -143,13 +113,12 @@ class TrainLoop:
             self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
             if dist.get_rank() == 0:
                 logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
-                self.model.load_state_dict(
+                self.main_model.load_state_dict(
                     dist_util.load_state_dict(
                         resume_checkpoint, map_location=dist_util.dev()
                     )
                 )
 
-            dist_util.sync_params(self.model.parameters())
 
     def _load_ema_parameters(self, rate):
         ema_params = copy.deepcopy(self.master_params)
@@ -179,11 +148,8 @@ class TrainLoop:
             )
             self.opt.load_state_dict(state_dict)
 
-    def _setup_fp16(self):
-        self.master_params = make_master_params(self.model_params)
-        self.model.convert_to_fp16()
-
     def run_loop(self):
+        self.ddp_main_model.train()
         while (
             not self.lr_anneal_steps
             or self.step + self.resume_step < self.lr_anneal_steps
@@ -204,14 +170,11 @@ class TrainLoop:
 
     def run_step(self, batch, cond):
         self.forward_backward(batch, cond)
-        if self.use_fp16:
-            self.optimize_fp16()
-        else:
-            self.optimize_normal()
+        self.optimize_fsdp()
         self.log_step()
 
     def forward_backward(self, batch, cond):
-        zero_grad(self.model_params)
+
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
             micro_cond = {
@@ -223,17 +186,18 @@ class TrainLoop:
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
-                self.ddp_model,
+                self.ddp_main_model,
                 micro,
                 t,
                 model_kwargs=micro_cond,
             )
 
-            if last_batch or not self.use_ddp:
-                losses = compute_losses()
-            else:
-                with self.ddp_model.no_sync():
+            with autocast():
+                if last_batch or not self.use_ddp:
                     losses = compute_losses()
+                else:
+                    with self.ddp_model.no_sync():
+                        losses = compute_losses()
 
             if isinstance(self.schedule_sampler, LossAwareSampler):
                 self.schedule_sampler.update_with_local_losses(
@@ -244,43 +208,19 @@ class TrainLoop:
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )
-            if self.use_fp16:
-                loss_scale = 2 ** self.lg_loss_scale
-                (loss * loss_scale).backward()
-            else:
-                loss.backward()
+            self.scaler.scale(loss).backward()
 
-    def optimize_fp16(self):
-        '''
-        if any(not th.isfinite(p.grad).all() for p in self.model_params):
-            self.lg_loss_scale -= 1
-            logger.log(f"Found NaN, decreased lg_loss_scale to {self.lg_loss_scale}")
-            return
-
-        model_grads_to_master_grads(self.model_params, self.master_params)
-        self.master_params[0].grad.mul_(1.0 / (2 ** self.lg_loss_scale))
-        self._log_grad_norm()
+    def optimize_fsdp(self):
         self._anneal_lr()
-        self.opt.step()
-        for rate, params in zip(self.ema_rate, self.ema_params):
-            update_ema(params, self.master_params, rate=rate)
-        master_params_to_model_params(self.model_params, self.master_params)
-        self.lg_loss_scale += self.fp16_scale_growth
-        '''
-        self._anneal_lr()
-
-    def optimize_normal(self):
-        self._log_grad_norm()
-        self._anneal_lr()
-        self.opt.step()
-        for rate, params in zip(self.ema_rate, self.ema_params):
-            update_ema(params, self.master_params, rate=rate)
-
-    def _log_grad_norm(self):
-        sqsum = 0.0
-        for p in self.master_params:
-            sqsum += (p.grad ** 2).sum().item()
-        logger.logkv_mean("grad_norm", np.sqrt(sqsum))
+        self.lg_loss_scale = self.scaler.get_scale()
+        self.scaler.step(self.opt)
+        self.scaler.update()
+        self.opt.zero_grad()
+        ps_main = list(self.ddp_main_model.parameters())
+        for ddp_ema_model, ema_rate in zip(self.ddp_ema_models, self.ema_rates):
+            ps_ema = list(ddp_ema_model.parameters())
+            for p_ema, p_main in zip(ps_ema, ps_main):
+                p_ema.detach().mul_(ema_rate).add_(p_main, alpha=1 - ema_rate)
 
     def _anneal_lr(self):
         if not self.lr_anneal_steps:
@@ -293,12 +233,11 @@ class TrainLoop:
     def log_step(self):
         logger.logkv("step", self.step + self.resume_step)
         logger.logkv("samples", (self.step + self.resume_step + 1) * self.global_batch)
-        if self.use_fp16:
-            logger.logkv("lg_loss_scale", self.lg_loss_scale)
+        logger.logkv("lg_loss_scale", self.lg_loss_scale)
 
     def save(self):
-        def save_checkpoint(rate, params):
-            state_dict = self._master_params_to_state_dict(params)
+        def save_checkpoint(rate, fsdp_model):
+            state_dict = fsdp_model.state_dict()
             if dist.get_rank() == 0:
                 logger.log(f"saving model {rate}...")
                 if not rate:
@@ -308,9 +247,9 @@ class TrainLoop:
                 with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
                     th.save(state_dict, f)
 
-        save_checkpoint(0, self.master_params)
-        for rate, params in zip(self.ema_rate, self.ema_params):
-            save_checkpoint(rate, params)
+        save_checkpoint(0, self.ddp_main_model)
+        for rate, ddp_model in zip(self.ema_rates, self.ema_models):
+            save_checkpoint(rate, ddp_model)
 
         if dist.get_rank() == 0:
             with bf.BlobFile(
@@ -320,24 +259,6 @@ class TrainLoop:
                 th.save(self.opt.state_dict(), f)
 
         dist.barrier()
-
-    def _master_params_to_state_dict(self, master_params):
-        if self.use_fp16:
-            master_params = unflatten_master_params(
-                list(self.model.parameters()), master_params
-            )
-        state_dict = self.model.state_dict()
-        for i, (name, _value) in enumerate(self.model.named_parameters()):
-            assert name in state_dict
-            state_dict[name] = master_params[i]
-        return state_dict
-
-    def _state_dict_to_master_params(self, state_dict):
-        params = [state_dict[name] for name, _ in self.model.named_parameters()]
-        if self.use_fp16:
-            return make_master_params(params)
-        else:
-            return params
 
 
 def parse_resume_step_from_filename(filename):
