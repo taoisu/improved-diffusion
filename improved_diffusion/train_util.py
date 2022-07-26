@@ -15,11 +15,14 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
     MixedPrecision,
 )
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    transformer_auto_wrap_policy,
+)
 
 from . import dist_util, logger
 from .resample import LossAwareSampler, UniformSampler
-from .unet import apply_fsdp_checkpointing
+from .unet import apply_fsdp_checkpointing, TimestepBlock, TimestepEmbedSequential
 
 
 class TrainLoop:
@@ -70,10 +73,19 @@ class TrainLoop:
 
         assert th.cuda.is_available()
         self.use_ddp = True
+        # auto_wrap_policy = functools.partial(
+        #     size_based_auto_wrap_policy,
+        #     min_num_params=int(2.5e7)
+        # )
+        auto_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={
+                TimestepEmbedSequential,
+            },
+        )
         FSDP_cls = functools.partial(
             FSDP,
-            cpu_offload=CPUOffload(offload_params=False),
-            auto_wrap_policy=size_based_auto_wrap_policy,
+            auto_wrap_policy=auto_wrap_policy,
             device_id=dist_util.dev(),
             mixed_precision=MixedPrecision(
                 param_dtype=th.float16,
@@ -81,7 +93,7 @@ class TrainLoop:
                 buffer_dtype=th.float16,
             )
         )
-        self.ddp_main_model = FSDP_cls(self.main_model)
+        self.ddp_main_model = FSDP_cls(self.main_model, cpu_offload=CPUOffload(offload_params=False))
         ddp_main_model = self.ddp_main_model
         apply_fsdp_checkpointing(ddp_main_model)
         ddp_main_model.train()

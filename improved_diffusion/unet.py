@@ -34,8 +34,8 @@ def apply_fsdp_checkpointing(model: FSDP):
 
     non_reentrant_wrapper = partial(
         checkpoint_wrapper,
-        offload_to_cpu=False,
-        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        offload_to_cpu=True,
+        checkpoint_impl=CheckpointImpl.REENTRANT,
     )
 
     def check_fn(submodule: nn.Module):
