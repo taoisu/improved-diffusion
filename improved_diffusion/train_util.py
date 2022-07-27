@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from torch.cuda.amp import autocast
 from torch.optim import AdamW
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     FullyShardedDataParallel as FSDP,
     CPUOffload,
@@ -22,7 +23,7 @@ from torch.distributed.fsdp.wrap import (
 
 from . import dist_util, logger
 from .resample import LossAwareSampler, UniformSampler
-from .unet import apply_fsdp_checkpointing, TimestepBlock, TimestepEmbedSequential
+from .unet import apply_checkpointing, TimestepEmbedSequential
 
 
 class TrainLoop:
@@ -73,29 +74,8 @@ class TrainLoop:
 
         assert th.cuda.is_available()
         self.use_ddp = True
-        # auto_wrap_policy = functools.partial(
-        #     size_based_auto_wrap_policy,
-        #     min_num_params=int(2.5e7)
-        # )
-        auto_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls={
-                TimestepEmbedSequential,
-            },
-        )
-        FSDP_cls = functools.partial(
-            FSDP,
-            auto_wrap_policy=auto_wrap_policy,
-            device_id=dist_util.dev(),
-            mixed_precision=MixedPrecision(
-                param_dtype=th.float16,
-                reduce_dtype=th.float16,
-                buffer_dtype=th.float16,
-            )
-        )
-        self.ddp_main_model = FSDP_cls(self.main_model, cpu_offload=CPUOffload(offload_params=False))
+        self.ddp_main_model = self._wrap_model(self.main_model)
         ddp_main_model = self.ddp_main_model
-        apply_fsdp_checkpointing(ddp_main_model)
         ddp_main_model.train()
 
         self.model_params = list(ddp_main_model.parameters())
@@ -110,13 +90,43 @@ class TrainLoop:
             # ]
             pass
         else:
-            self.ddp_ema_models = [FSDP_cls(ema_model) for ema_model in self.ema_models]
+            self.ddp_ema_models = [self._wrap_model(ema_model) for ema_model in self.ema_models]
             for ddp_ema_model in self.ddp_ema_models:
                 for pair_master, pair_ema in zip(ddp_main_model.named_parameters(), ddp_ema_model.named_parameters()):
                     name_master, p_master = pair_master
                     name_ema, p_ema = pair_ema
                     assert name_master == name_ema
                     p_ema.detach().copy_(p_master.detach())
+
+    def _wrap_model(self, model, use_fsdp=True):
+        if use_fsdp:
+            auto_wrap_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls={
+                    TimestepEmbedSequential,
+                },
+            )
+            model = FSDP(
+                model,
+                cpu_offload=CPUOffload(offload_params=False),
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=dist_util.dev(),
+                mixed_precision=MixedPrecision(
+                    param_dtype=th.float16,
+                    reduce_dtype=th.float16,
+                    buffer_dtype=th.float16,
+                ))
+        else:
+            dev = dist_util.dev()
+            model.to(dev)
+            model = DDP(
+                model,
+                device_ids=[dev],
+                output_device=dev,
+                broadcast_buffers=True,
+            )
+        apply_checkpointing(model)
+        return model
 
     def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint

@@ -20,7 +20,6 @@ from .nn import (
 )
 
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper,
     CheckpointImpl,
     apply_activation_checkpointing_wrapper,
     CheckpointWrapper,
@@ -28,20 +27,18 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     FullyShardedDataParallel as FSDP,
 )
+from fairscale.nn.checkpoint import checkpoint_wrapper
 
 
-def apply_fsdp_checkpointing(model: FSDP):
+def apply_checkpointing(model: FSDP):
 
     non_reentrant_wrapper = partial(
         checkpoint_wrapper,
         offload_to_cpu=True,
-        checkpoint_impl=CheckpointImpl.REENTRANT,
     )
 
     def check_fn(submodule: nn.Module):
-        is_resblock = isinstance(submodule, ResBlock)
-        is_attnblock = isinstance(submodule, AttentionBlock)
-        return is_resblock or is_attnblock
+        return isinstance(submodule, (ResBlock, AttentionBlock))
 
     apply_activation_checkpointing_wrapper(
         model,
