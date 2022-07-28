@@ -125,7 +125,7 @@ class TrainLoop:
                 output_device=dev,
                 broadcast_buffers=True,
             )
-        apply_checkpointing(model)
+        apply_checkpointing(model, mode=0)
         return model
 
     def _load_and_sync_parameters(self):

@@ -1,11 +1,39 @@
 import argparse
 import inspect
 
+from collections import namedtuple
+from transformers import AutoTokenizer
+from transformers.models.t5.modeling_t5 import T5Block, T5EncoderModel
+from transformers.models.opt.modeling_opt import OPTDecoderLayer, OPTDecoder
+
 from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
 from .unet import SuperResModel, UNetModel
 
 NUM_CLASSES = 1000
+
+
+class AutoTextModel:
+
+    def from_pretrained(model_name):
+        kwargs = {
+            'use_cache': False,
+            'low_cpu_mem_usage': True
+        }
+        if model_name.startswith('google/t5'):
+            return T5EncoderModel.from_pretrained(model_name, **kwargs)
+        elif model_name.startswith('facebook/opt'):
+            return OPTDecoder.from_pretrained(model_name, **kwargs)
+        else:
+            raise NotImplementedError(model_name)
+
+class AutoWrapLayer:
+
+    def from_pretrained(model_name):
+        if model_name.startswith('google/t5'):
+            return T5Block
+        elif model_name.startswith('facebook/opt'):
+            return OPTDecoderLayer
 
 
 def model_and_diffusion_defaults():
@@ -30,8 +58,8 @@ def model_and_diffusion_defaults():
         predict_xstart=False,
         rescale_timesteps=True,
         rescale_learned_sigmas=True,
-        use_checkpoint=False,
         use_scale_shift_norm=True,
+        text_model=None,
     )
 
 
@@ -53,16 +81,15 @@ def create_model_and_diffusion(
     predict_xstart,
     rescale_timesteps,
     rescale_learned_sigmas,
-    use_checkpoint,
     use_scale_shift_norm,
+    text_model,
 ):
-    model = create_model(
+    unet_model = create_unet_model(
         image_size,
         num_channels,
         num_res_blocks,
         learn_sigma=learn_sigma,
         class_cond=class_cond,
-        use_checkpoint=use_checkpoint,
         attention_resolutions=attention_resolutions,
         num_heads=num_heads,
         num_heads_upsample=num_heads_upsample,
@@ -80,16 +107,26 @@ def create_model_and_diffusion(
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
     )
-    return model, diffusion
+    text_model = create_text_model(model_name=text_model)
+    return unet_model, diffusion, text_model
 
 
-def create_model(
+def create_text_model(
+    model_name
+):
+    model = AutoTextModel.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    layer = AutoWrapLayer.from_pretrained(model_name)
+    TextEncoder = namedtuple('TextEncoder', ['model', 'tokenizer', 'layer'])
+    return TextEncoder(model=model, tokenizer=tokenizer, layer=layer)
+
+
+def create_unet_model(
     image_size,
     num_channels,
     num_res_blocks,
     learn_sigma,
     class_cond,
-    use_checkpoint,
     attention_resolutions,
     num_heads,
     num_heads_upsample,
@@ -153,7 +190,6 @@ def sr_create_model_and_diffusion(
     predict_xstart,
     rescale_timesteps,
     rescale_learned_sigmas,
-    use_checkpoint,
     use_scale_shift_norm,
 ):
     model = sr_create_model(
@@ -163,7 +199,6 @@ def sr_create_model_and_diffusion(
         num_res_blocks,
         learn_sigma=learn_sigma,
         class_cond=class_cond,
-        use_checkpoint=use_checkpoint,
         attention_resolutions=attention_resolutions,
         num_heads=num_heads,
         num_heads_upsample=num_heads_upsample,
@@ -190,7 +225,6 @@ def sr_create_model(
     num_res_blocks,
     learn_sigma,
     class_cond,
-    use_checkpoint,
     attention_resolutions,
     num_heads,
     num_heads_upsample,
@@ -219,7 +253,6 @@ def sr_create_model(
         dropout=dropout,
         channel_mult=channel_mult,
         num_classes=(NUM_CLASSES if class_cond else None),
-        use_checkpoint=use_checkpoint,
         num_heads=num_heads,
         num_heads_upsample=num_heads_upsample,
         use_scale_shift_norm=use_scale_shift_norm,
