@@ -107,8 +107,16 @@ def create_model_and_diffusion(
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
     )
-    text_model = create_text_model(model_name=text_model)
-    return unet_model, diffusion, text_model
+    text_encoder = create_text_model(model_name=text_model)
+    return unet_model, diffusion, text_encoder
+
+
+class TextEncoder:
+
+    def __init__(self, model, tokenizer, layer):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.layer = layer
 
 
 def create_text_model(
@@ -117,8 +125,8 @@ def create_text_model(
     model = AutoTextModel.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     layer = AutoWrapLayer.from_pretrained(model_name)
-    TextEncoder = namedtuple('TextEncoder', ['model', 'tokenizer', 'layer'])
-    return TextEncoder(model=model, tokenizer=tokenizer, layer=layer)
+    encoder = TextEncoder(model, tokenizer, layer)
+    return encoder
 
 
 def create_unet_model(

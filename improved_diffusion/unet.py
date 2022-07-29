@@ -33,7 +33,7 @@ from fairscale.nn.checkpoint import (
 )
 
 
-def apply_checkpointing(model: FSDP, mode: int = 0):
+def apply_checkpointing(model: FSDP, modules: tuple, mode: int = 0):
 
     if mode == 0:
         wrapper = partial(checkpoint_wrapper_torch, checkpoint_impl=CheckpointImpl.REENTRANT, offload_to_cpu=True)
@@ -47,7 +47,7 @@ def apply_checkpointing(model: FSDP, mode: int = 0):
         wrapper = partial(checkpoint_wrapper_fairscale, offload_to_cpu=True)
 
     def check_fn(submodule: nn.Module):
-        return isinstance(submodule, (ResBlock, AttentionBlock))
+        return isinstance(submodule, modules)
 
     apply_activation_checkpointing_wrapper(
         model,

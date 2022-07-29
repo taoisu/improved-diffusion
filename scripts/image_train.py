@@ -23,7 +23,7 @@ def main():
     logger.configure()
 
     logger.log("creating model and diffusion...")
-    model, diffusion = create_model_and_diffusion(
+    unet_model, diffusion, text_encoder = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
@@ -38,7 +38,8 @@ def main():
 
     logger.log("training...")
     TrainLoop(
-        model=model,
+        unet_model=unet_model,
+        text_encoder=text_encoder,
         diffusion=diffusion,
         data=data,
         batch_size=args.batch_size,

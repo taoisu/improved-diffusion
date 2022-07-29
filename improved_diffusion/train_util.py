@@ -23,7 +23,7 @@ from torch.distributed.fsdp.wrap import (
 
 from . import dist_util, logger
 from .resample import LossAwareSampler, UniformSampler
-from .unet import apply_checkpointing, TimestepEmbedSequential
+from .unet import AttentionBlock, ResBlock, apply_checkpointing, TimestepEmbedSequential
 
 
 class TrainLoop:
@@ -31,7 +31,8 @@ class TrainLoop:
     def __init__(
         self,
         *,
-        model,
+        unet_model,
+        text_encoder,
         diffusion,
         data,
         batch_size,
@@ -45,7 +46,8 @@ class TrainLoop:
         weight_decay=0.0,
         lr_anneal_steps=0,
     ):
-        self.main_model = model
+        self.main_model = unet_model
+        self.text_encoder = text_encoder
         self.diffusion = diffusion
         self.data = data
         self.batch_size = batch_size
@@ -56,7 +58,7 @@ class TrainLoop:
             if isinstance(ema_rate, float)
             else [float(x) for x in ema_rate.split(",")]
         )
-        self.ema_models = [copy.deepcopy(model) for _ in self.ema_rates]
+        self.ema_models = [copy.deepcopy(unet_model) for _ in self.ema_rates]
         self.log_interval = log_interval
         self.save_interval = save_interval
         self.resume_checkpoint = resume_checkpoint
@@ -74,7 +76,8 @@ class TrainLoop:
 
         assert th.cuda.is_available()
         self.use_ddp = True
-        self.ddp_main_model = self._wrap_model(self.main_model)
+        self.ddp_main_model = self._wrap_unet_model(self.main_model)
+        self.ddp_text_encoder = self._wrap_text_encoder(self.text_encoder)
         ddp_main_model = self.ddp_main_model
         ddp_main_model.train()
 
@@ -90,7 +93,7 @@ class TrainLoop:
             # ]
             pass
         else:
-            self.ddp_ema_models = [self._wrap_model(ema_model) for ema_model in self.ema_models]
+            self.ddp_ema_models = [self._wrap_unet_model(ema_model) for ema_model in self.ema_models]
             for ddp_ema_model in self.ddp_ema_models:
                 for pair_master, pair_ema in zip(ddp_main_model.named_parameters(), ddp_ema_model.named_parameters()):
                     name_master, p_master = pair_master
@@ -98,7 +101,38 @@ class TrainLoop:
                     assert name_master == name_ema
                     p_ema.detach().copy_(p_master.detach())
 
-    def _wrap_model(self, model, use_fsdp=True):
+    def _wrap_text_encoder(self, encoder, use_fsdp=True):
+        if use_fsdp:
+            auto_wrap_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls=(
+                    encoder.layer,
+                ),
+            )
+            encoder.model = FSDP(
+                encoder.model,
+                # cpu_offload=CPUOffload(offload_params=True),
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=dist_util.dev(),
+                mixed_precision=MixedPrecision(
+                    param_dtype=th.float16,
+                    reduce_dtype=th.float16,
+                    buffer_dtype=th.float16,
+                ))
+        else:
+            dev = dist_util.dev()
+            encoder.model.to(dev)
+            encoder.model = DDP(
+                encoder.model,
+                device_ids=[dev],
+                output_device=dev,
+                broadcast_buffers=True,
+            )
+        apply_checkpointing(encoder.model, (encoder.layer, ), mode=0)
+        return encoder
+
+
+    def _wrap_unet_model(self, model, use_fsdp=True):
         if use_fsdp:
             auto_wrap_policy = functools.partial(
                 transformer_auto_wrap_policy,
@@ -125,7 +159,7 @@ class TrainLoop:
                 output_device=dev,
                 broadcast_buffers=True,
             )
-        apply_checkpointing(model, mode=0)
+        apply_checkpointing(model, (ResBlock, AttentionBlock), mode=0)
         return model
 
     def _load_and_sync_parameters(self):
